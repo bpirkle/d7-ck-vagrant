@@ -1,287 +1,564 @@
-# https://fourkitchens.atlassian.net/wiki/display/TECH/Configure+Varnish+3+for+Drupal+7
- 
-# This is a basic VCL configuration file for varnish.  See the vcl(7)
-# man page for details on VCL syntax and semantics.
- 
-# TODO: Update internal subnet ACL and security.
- 
-# Define the internal network subnet.
-# These are used below to allow internal access to certain files while not
-# allowing access from the public internet.
-# acl internal {
-#  "192.10.0.0"/24;
-# }
- 
-# Default backend definition.  Set this to point to your content
-# server.
-#
 backend default {
   .host = "127.0.0.1";
   .port = "80";
 }
- 
-# Respond to incoming requests.
+
+/**
+ * Example VCL for Authcache Varnish / Authcache ESI
+ * =================================================
+ *
+ * By default, the Varnish Cache is bypassed whenever there is a Cookie-Header
+ * present on the request. This is a reasonable default behavior because the
+ * rationale behind HTTP cookies is essentially to enable personalization of
+ * web applications. The results would be disastrous if personalized pages
+ * would be cached and delivered regardless of the contents of the Cookie
+ * header. For example on an E-commerce site users could end up seeing each
+ * others shopping cart, only to name a rather harmless case.
+ *
+ * This VCL together with Drupal, Authcache Varnish and Authcache ESI allows
+ * Varnish to cache personalized content in a safe way without risking the
+ * side-effects mentioned above.
+ *
+ *
+ * 1. Backend sets "Vary: X-Authcache-Key" header
+ * ----------------------------------------------
+ * When the Drupal core option "Cache pages for anonymous users" is enabled, a
+ * "Vary: Cookie" header is added to each response from the site. This
+ * essentially mandates an intermediate cache server (and also the browser
+ * cache) to only deliver a cached version of the page when the Cookie header
+ * on a subsequent request is identical to the one of the original request,
+ * when the page was first stored in the cache. However it is rather
+ * inefficient to store every page for every user separately in a caching
+ * server.
+ *
+ * Because of this, a Drupal site with the Authcache Varnish module enabled
+ * will send a "Vary: X-Authcache-Key" header instead of "Vary: Cookie". The
+ * caching server now will compare X-Authcache-Key request headers when
+ * determining whether a cached version of a page can be sent to the client.
+ * However because no browser is sending an X-Authcache-Key header along with a
+ * HTTP request, it is necessary to add this header from within the VCL before
+ * looking up the object in the cache.
+ *
+ *
+ * 2. Retrieve X-Authcache-Key form the backend and add it onto the request
+ * ------------------------------------------------------------------------
+ * The authcache key is a value which is unique for every combination of Drupal
+ * user roles. The keys of two users are only equal if both of them have the
+ * exact same combination of user roles and therefore identical permissions.
+ *
+ * Authcache Varnish exposes the callback /authcache-varnish-get-key which
+ * returns the authcache key for the currently logged in user. Except when one
+ * of the roles is excluded from caching, in that case no key is returned from
+ * the callback.
+ *
+ * When a client requests the page /original-url, effectively two requests will
+ * be issued by this VCL:
+ *   1. GET /authcache-varnish-get-key
+ *       -> add resulting X-Authcache-Key to the request and restart.
+ *   2. GET /original-url
+ *       -> deliver result to client
+ * Unfortunately the VCL implementation of this logic is somewhat complicated.
+ * Code sections for the key-retrieval are spread over vcl_recv, vcl_fetch and
+ * vcl_deliver.
+ *
+ *
+ * 3. Embed personalized fragments using ESI
+ * -----------------------------------------
+ * The process described in the preceding section only helps with improving
+ * cache efficiency but not with personalization. A site configured like this
+ * still is prone to information leakage (e.g. Eve seeing the shopping cart of
+ * Alice). In order to solve this problem, personalized items on a page (like a
+ * shopping cart block) need to be identified and substituted with ESI tags.
+ * Authcache provides a set of modules out of the box helping with substituting
+ * personalized content (e.g. Blocks, Views, Form Tokens, Menu Tabs and Action
+ * Links, ...).
+ *
+ * When Authcache ESI is enabled in Drupal, the HTTP header X-Authcache-Do-ESI
+ * is added to every response from the backend whenever an ESI tag was added to
+ * the markup. This allows vcl_fetch to selectively enable ESI processing only
+ * when necessary.
+ *
+ * Also Drupal/Authcache ESI will only emit ESI tags, if the X-Authcache-Do-ESI
+ * header is on the request to the backend. This header is added from within
+ * vcl_miss. As a consequence the backend will not emit ESI tags when caching
+ * is bypassed, e.g. due to a "return (pass)" from within vcl_recv.
+ *
+ *
+ * Credits & Sources
+ * -----------------
+ * * Josh Waihi - Authenticated page caching with Varnish & Drupal:
+ *   http://joshwaihi.com/content/authenticated-page-caching-varnish-drupal
+ * * Four Kitchens - Configure Varnish 3 for Drupal 7:
+ *   https://fourkitchens.atlassian.net/wiki/display/TECH/Configure+Varnish+3+for+Drupal+7
+ * * The Varnish Book:
+ *   https://www.varnish-software.com/static/book/
+ * * The Varnish Book - VCL Request Flow:
+ *   https://www.varnish-software.com/static/book/_images/vcl.png
+ */
+
+/**
+ * Derive the cache identifier for the key cache.
+ */
+sub authcache_key_cid {
+  if (req.http.Cookie ~ "(^|;)\s*S?SESS[a-z0-9]+=") {
+    // Use the whole session cookie to differentiate between authenticated
+    // users.
+    set req.http.X-Authcache-Key-CID = "sess:"+regsuball(req.http.Cookie, "^(.*;\s*)?(S?SESS[a-z0-9]+=[^;]*).*$", "\2");
+  }
+  else {
+    // If authcache key retrieval was enforced for anonymous traffic, the HTTP
+    // host is used in order to keep apart anonymous users of different
+    // domains.
+    set req.http.X-Authcache-Key-CID = "host:"+req.http.host;
+  }
+
+  /* Optional: When using authcache_esi alongside with authcache_ajax */
+  // if (req.http.Cookie ~ "(^|;)\s*has_js=1\s*($|;)") {
+  //   set req.http.X-Authcache-Key-CID = req.http.X-Authcache-Key-CID + "+js";
+  // }
+  // else {
+  //   set req.http.X-Authcache-Key-CID = req.http.X-Authcache-Key-CID + "-js";
+  // }
+
+  /* Optional: When serving HTTP/HTTPS */
+  // if (req.http.X-Forwarded-Proto ~ "(?i)https") {
+  //   set req.http.X-Authcache-Key-CID = req.http.X-Authcache-Key-CID + "+ssl";
+  // }
+  // else {
+  //   set req.http.X-Authcache-Key-CID = req.http.X-Authcache-Key-CID + "-ssl";
+  // }
+}
+
 sub vcl_recv {
-  # Use anonymous, cached pages if all backends are down.
-  if (!req.backend.healthy) {
-    unset req.http.Cookie;
+  /**
+   * BEGIN required authcache key-retrieval logic
+   *
+   * It should not be necessary to modify this section. Please file a bug or
+   * feature request if you find a situation where this part of the VCL is not
+   * appropriate.
+   *
+   * https://drupal.org/project/issues/authcache
+   **/
+
+  /**
+   * Do not allow the client to pass in X-Authcache-Get-Key header unless the
+   * VCL is under test (varnishtest uses -n /tmp/vtc.XXXXX.YYYYYYYY).
+   */
+  if (req.restarts == 0 && server.identity !~ "^/tmp/vtc.") {
+    unset req.http.X-Authcache-Do-ESI;
+    unset req.http.X-Authcache-Get-Key;
+    unset req.http.X-Authcache-Key-CID;
+    unset req.http.X-Authcache-Key;
   }
- 
-  # Allow the backend to serve up stale content if it is responding slowly.
-  set req.grace = 6h;
- 
-  # Pipe these paths directly to Apache for streaming.
-  #if (req.url ~ "^/admin/content/backup_migrate/export") {
-  #  return (pipe);
-  #}
- 
-  if (req.restarts == 0) {
-    if (req.http.x-forwarded-for) {
-      set req.http.X-Forwarded-For = req.http.X-Forwarded-For + ", " + client.ip;
+
+  /**
+   * Do not allow outside access to key retrieval callback.
+   */
+  if (req.restarts == 0 && req.url ~ "^/authcache-varnish-get-key") {
+    error 404 "Page not found.";
+  }
+
+  /**
+   * Request was restarted from vcl_deliver after the authcache key was
+   * obtained from the backend.
+   */
+  if (req.restarts > 0 && req.http.X-Authcache-Get-Key == "received") {
+    // Restore the original URL.
+    set req.url = req.http.X-Original-URL;
+    unset req.http.X-Original-URL;
+
+    // Remove cache id header.
+    unset req.http.X-Authcache-Key-CID;
+
+    // Key retrieval is over now
+    set req.http.X-Authcache-Get-Key = "done";
+
+    // If the backend delivered a key, we proceed with a lookup, otherwise the
+    // cache needs to be bypassed.
+    if (req.http.X-Authcache-Key) {
+      return (lookup);
     }
     else {
-      set req.http.X-Forwarded-For = client.ip;
-    }
-  }
- 
-  # For global redirect
-  if (req.url ~ "node\?page=[0-9]+$") {
-    set req.url = regsub(req.url, "node(\?page=[0-9]+$)", "\1");
-    return (lookup);
-  }
- 
-  # Do not cache these paths.
-  if (req.url ~ "^/status\.php$" ||
-      req.url ~ "^/update\.php$" ||
-      req.url ~ "^/admin$" ||
-      req.url ~ "^/admin/.*$" ||
-      req.url ~ "^/flag/.*$" ||
-      req.url ~ "^.*/ajax/.*$" ||
-      req.url ~ "^.*/ahah/.*$") {
-       return (pass);
-  }
- 
-  # Do not allow outside access to cron.php or install.php.
-  #if (req.url ~ "^/(cron|install)\.php$" && !client.ip ~ internal) {
-    # Have Varnish throw the error directly.
-  #  error 404 "Page not found.";
-    # Use a custom error page that you've defined in Drupal at the path "404".
-    # set req.url = "/404";
-  #}
- 
-  # Always cache the following file types for all users. This list of extensions
-  # appears twice, once here and again in vcl_fetch so make sure you edit both
-  # and keep them equal.
-  if (req.url ~ "(?i)\.(pdf|asc|dat|txt|doc|xls|ppt|tgz|csv|png|gif|jpeg|jpg|ico|swf|css|js)(\?.*)?$") {
-    unset req.http.Cookie;
-  }
- 
-  # Remove all cookies that Drupal doesn't need to know about. We explicitly
-  # list the ones that Drupal does need, the SESS and NO_CACHE. If, after
-  # running this code we find that either of these two cookies remains, we
-  # will pass as the page cannot be cached.
-  if (req.http.Cookie) {
-    # 1. Append a semi-colon to the front of the cookie string.
-    # 2. Remove all spaces that appear after semi-colons.
-    # 3. Match the cookies we want to keep, adding the space we removed
-    #    previously back. (\1) is first matching group in the regsuball.
-    # 4. Remove all other cookies, identifying them by the fact that they have
-    #    no space after the preceding semi-colon.
-    # 5. Remove all spaces and semi-colons from the beginning and end of the
-    #    cookie string.
-    set req.http.Cookie = ";" + req.http.Cookie;
-    set req.http.Cookie = regsuball(req.http.Cookie, "; +", ";");    
-    set req.http.Cookie = regsuball(req.http.Cookie, ";(SESS[a-z0-9]+|SSESS[a-z0-9]+|NO_CACHE)=", "; \1=");
-    set req.http.Cookie = regsuball(req.http.Cookie, ";[^ ][^;]*", "");
-    set req.http.Cookie = regsuball(req.http.Cookie, "^[; ]+|[; ]+$", "");
- 
-    if (req.http.Cookie == "") {
-      # If there are no remaining cookies, remove the cookie header. If there
-      # aren't any cookie headers, Varnish's default behavior will be to cache
-      # the page.
-      unset req.http.Cookie;
-    }
-    else {
-      # If there is any cookies left (a session or NO_CACHE cookie), do not
-      # cache the page. Pass it on to Apache directly.
       return (pass);
     }
   }
-}
- 
-# Set a header to track a cache HIT/MISS.
-sub vcl_deliver {
-  if (obj.hits > 0) {
-    set resp.http.X-Varnish-Cache = "HIT";
+  /* END required authcache key-retrieval logic */
+
+
+
+  // TODO: Add purge handler, access checks and other stuff relying on
+  // non-standard HTTP verbs here.
+
+  // /**
+  //  * Example 1: Allow purge from all clients in the purge-acl. Note that
+  //  * additional VCL is necessary to make this work, notably the acl and some
+  //  * code in vcl_miss and vcl_hit.
+  //  *
+  //  * More information on:
+  //  * https://www.varnish-cache.org/docs/3.0/tutorial/purging.html
+  //  */
+  // if (req.method == "PURGE") {
+  //   if (!client.ip ~ purge) {
+  //     error 405 "Not allowed.";
+  //   }
+  //   return (lookup);
+  // }
+
+  // /**
+  //  * Example 2: Do not allow outside access to cron.php or install.php.
+  //  */
+  // if (req.url ~ "^/(cron|install)\.php$" && !client.ip ~ internal) {
+  //   error 404 "Page not found.";
+  // }
+
+
+
+  /**
+   * BEGIN default.vcl
+   *
+   * It should not be necessary to modify this section. Please file a bug or
+   * feature request if you find a situation where this part of the VCL is not
+   * appropriate.
+   *
+   * https://drupal.org/project/issues/authcache
+   */
+  if (req.restarts == 0) {
+    if (req.http.x-forwarded-for) {
+      set req.http.X-Forwarded-For =
+        req.http.X-Forwarded-For + ", " + client.ip;
+    } else {
+      set req.http.X-Forwarded-For = client.ip;
+    }
   }
-  else {
-    set resp.http.X-Varnish-Cache = "MISS";
+  if (req.request != "GET" &&
+      req.request != "HEAD" &&
+      req.request != "PUT" &&
+      req.request != "POST" &&
+      req.request != "TRACE" &&
+      req.request != "OPTIONS" &&
+      req.request != "DELETE") {
+    /* Non-RFC2616 or CONNECT which is weird. */
+    return (pipe);
   }
+  if (req.request != "GET" && req.request != "HEAD") {
+    /* We only deal with GET and HEAD by default */
+    return (pass);
+  }
+
+  /**
+   * EDIT for authcache: We *need* to allow caching for clients having certain
+   * cookies on their request.
+   */
+  if (req.http.Authorization /* || req.http.Cookie */) {
+    /* Not cacheable by default */
+    return (pass);
+  }
+  /* END default.vcl */
+
+
+
+  // TODO: Place your custom *pass*-rules here. Do *not* introduce any lookups.
+
+  // /* Example 1: Never cache admin/cron/user pages. */
+  // if (
+  //     req.url ~ "^/admin$" ||
+  //     req.url ~ "^/admin/.*$" ||
+  //     req.url ~ "^/batch.*$" ||
+  //     req.url ~ "^/comment/edit.*$" ||
+  //     req.url ~ "^/cron\.php$" ||
+  //     req.url ~ "^/file/ajax/.*" ||
+  //     req.url ~ "^/install\.php$" ||
+  //     req.url ~ "^/node/*/edit$" ||
+  //     req.url ~ "^/node/*/track$" ||
+  //     req.url ~ "^/node/add/.*$" ||
+  //     req.url ~ "^/system/files/*.$" ||
+  //     req.url ~ "^/system/temporary.*$" ||
+  //     req.url ~ "^/tracker$" ||
+  //     req.url ~ "^/update\.php$" ||
+  //     req.url ~ "^/user$" ||
+  //     req.url ~ "^/user/.*$" ||
+  //     req.url ~ "^/users/.*$") {
+  //   return (pass);
+  // }
+
+  // /**
+  //  * Example 2: Remove all but
+  //  * - the session cookie (SESSxxx, SSESSxxx)
+  //  * - the cache invalidation cookie for authcache p13n (aucp13n)
+  //  * - the NO_CACHE cookie from the Bypass Advanced module
+  //  * - the nocache cookie from authcache
+  //  *
+  //  * Note: Please also add the has_js cookie to the list if Authcache Ajax
+  //  * is also enabled in the backend. Also if you have Authcache Debug enabled,
+  //  * you should let through the aucdbg cookie.
+  //  *
+  //  * More information on:
+  //  * https://www.varnish-cache.org/docs/3.0/tutorial/cookies.html
+  //  */
+  // if (req.http.Cookie) {
+  //   set req.http.Cookie = ";" + req.http.Cookie;
+  //   set req.http.Cookie = regsuball(req.http.Cookie, "; +", ";");
+  //   set req.http.Cookie = regsuball(req.http.Cookie, ";(S?SESS[a-z0-9]+|aucp13n|NO_CACHE|nocache)=", "; \1=");
+  //   set req.http.Cookie = regsuball(req.http.Cookie, ";[^ ][^;]*", "");
+  //   set req.http.Cookie = regsuball(req.http.Cookie, "^[; ]+|[; ]+$", "");
+
+  //   if (req.http.Cookie == "") {
+  //     unset req.http.Cookie;
+  //   }
+  // }
+
+  // /**
+  //  * Example 3: Only attempt authcache key retrieval for the domain
+  //  * example.com and skip it for all other domains.
+  //  *
+  //  * Note: When key retrieval is forcibly prevented, the default VCL rules
+  //  * will kick in. I.e. only requests having no cookies at all will be
+  //  * cacheable.
+  //  */
+  // if (req.http.host != "example.com" && req.http.host != "www.example.com") {
+  //   set req.http.X-Authcache-Get-Key = "skip";
+  // }
+
+  /**
+   * Example 4: Trigger key-retrieval for all users, including anonymous.
+   *
+   * Forcing key-retrieval for users without a session enables caching even for
+   * requests with cookies. This may come in handy in one of the following
+   * situations:
+   * - A custom key generator is in place for anonymous users. E.g. to separate
+   *   cache bins according to language / region / device type.
+   * - The Authcache Debug widget is enabled for all users (including anonymous).
+   */
+  if (!req.http.X-Authcache-Get-Key) {
+    set req.http.X-Authcache-Get-Key = "get";
+  }
+
+
+  /**
+   * BEGIN required authcache key-retrieval logic
+   *
+   * It should not be necessary to modify this section. Please file a bug or
+   * feature request if you find a situation where this part of the VCL is not
+   * appropriate.
+   *
+   * https://drupal.org/project/issues/authcache
+   **/
+  if (req.restarts == 0) {
+    /**
+     * Before fulfilling a request, the authcache-key needs to be retrieved
+     * either from the cache or the backend.
+     *
+     * If the variable X-Authcache-Get-Key is set to "get", the request will
+     * enter key-retrieval phase before the requested page is delivered. If
+     * it is set to "skip", key-retrieval is not attempted.
+     *
+     * If the users VCL above did not specify whether key retrieval should be
+     * performed or not, the default behavior is to skip it as long as there is
+     * no session on the request.
+     */
+    if (!req.http.X-Authcache-Get-Key && req.http.Cookie ~ "(^|;)\s*S?SESS[a-z0-9]+=") {
+      set req.http.X-Authcache-Get-Key = "get";
+    }
+
+    if (req.http.X-Authcache-Get-Key != "get") {
+      set req.http.X-Authcache-Get-Key = "skip";
+    }
+  }
+
+  // Skip cache if there are cookies on the request and key-retrieval is
+  // disabled.
+  if (req.http.X-Authcache-Get-Key == "skip" && req.http.Cookie) {
+    return (pass);
+  }
+
+  // Skip cache when key-retrieval is enabled but nocache-cookie is on the
+  // request.
+  if (req.http.X-Authcache-Get-Key && req.http.X-Authcache-Get-Key != "skip" && req.http.Cookie ~ "(^|;)\s*nocache=1\s*($|;)") {
+    return (pass);
+  }
+
+  // Retrieve the authcache-key from /authcache-varnish-get-key before each
+  // request. Upon vcl_deliver the authcacke-key is copied over to the
+  // X-Authcache-Key request header and the request is restarted.
+  if (req.http.X-Authcache-Get-Key == "get") {
+    call authcache_key_cid;
+    set req.http.X-Original-URL = req.url;
+    set req.url = "/authcache-varnish-get-key";
+    set req.http.X-Authcache-Get-Key = "sent";
+  }
+
+  return (lookup);
+  /* END required authcache key-retrieval logic */
 }
- 
-# Code determining what to do when serving items from the Apache servers.
-# beresp == Back-end response from the web server.
+
+/**
+ * Tell the backend that ESI processing is available. The Authcache ESI
+ * module will only emit tags if this header is present on the request.
+ */
+sub vcl_miss {
+  /**
+   * BEGIN required authcache ESI header
+   *
+   * It should not be necessary to modify this section. Please file a bug or
+   * feature request if you find a situation where this part of the VCL is not
+   * appropriate.
+   *
+   * https://drupal.org/project/issues/authcache
+   **/
+  if (req.http.X-Authcache-Get-Key && req.http.X-Authcache-Get-Key != "skip") {
+    set bereq.http.X-Authcache-Do-ESI = 1;
+  }
+
+  // Add authcache-header for ESI requests going to the authcache_p13n front
+  // controller.
+  if (bereq.http.X-Authcache-Do-ESI && req.esi_level > 0) {
+    set bereq.http.X-Authcache = 1;
+  }
+  /* END required authcache ESI header */
+}
+
 sub vcl_fetch {
-  # We need this to cache 404s, 301s, 500s. Otherwise, depending on backend but
-  # definitely in Drupal's case these responses are not cacheable by default.
-  if (beresp.status == 404 || beresp.status == 301 || beresp.status == 500) {
-    set beresp.ttl = 10m;
+  /**
+   * BEGIN required authcache key-retrieval logic
+   *
+   * It should not be necessary to modify this section. Please file a bug or
+   * feature request if you find a situation where this part of the VCL is not
+   * appropriate.
+   *
+   * https://drupal.org/project/issues/authcache
+   **/
+
+  // Store result of key retrieval for 10 minutes. Do this regardless of
+  // whether the request was successful or not. E.g. when the Authcache Varnish
+  // module is disabled in the backend (no matter whether on purpose or not),
+  // it is still desirable to cache the resulting 404.
+  if (req.http.X-Authcache-Get-Key == "sent") {
+    // If backend did not specify a max-age, assume 10 minutes.
+    if (beresp.ttl <= 0 s) {
+      set beresp.ttl = 10 m;
+    }
+
+    // Ensure that we vary on X-Authcache-Key-CID
+    if (beresp.http.Vary !~ "X-Authcache-Key-CID") {
+        set beresp.http.Vary = beresp.http.Vary + ", X-Authcache-Key-CID";
+        set beresp.http.Vary = regsub(beresp.http.Vary, "^,\s*", "");
+    }
+
+    return (deliver);
   }
- 
-  # Don't allow static files to set cookies.
-  # (?i) denotes case insensitive in PCRE (perl compatible regular expressions).
-  # This list of extensions appears twice, once here and again in vcl_recv so
-  # make sure you edit both and keep them equal.
-  if (req.url ~ "(?i)\.(pdf|asc|dat|txt|doc|xls|ppt|tgz|csv|png|gif|jpeg|jpg|ico|swf|css|js)(\?.*)?$") {
-    unset beresp.http.set-cookie;
+  /* END required authcache key-retrieval logic */
+
+  /**
+   * BEGIN required authcache ESI header
+   *
+   * It should not be necessary to modify this section. Please file a bug or
+   * feature request if you find a situation where this part of the VCL is not
+   * appropriate.
+   *
+   * https://drupal.org/project/issues/authcache
+   **/
+  // Turn on ESI processing when requested by backend
+  if (beresp.http.X-Authcache-Do-ESI) {
+    set beresp.do_esi = true;
   }
- 
-  # Allow items to be stale if needed.
-  set beresp.grace = 6h;
+
+  // Ensure that the result is cached individually for each session if
+  // Cache-Control header on the response of an Authcache ESI request
+  // contains the "private" keyword.
+  if (bereq.http.X-Authcache-Do-ESI && req.esi_level > 0) {
+    if (beresp.http.Cache-Control ~ "(private)" && beresp.http.Vary !~ "Cookie") {
+      set beresp.http.Vary = beresp.http.Vary + ", Cookie";
+      set beresp.http.Vary = regsub(beresp.http.Vary, "^,\s*", "");
+    }
+    elseif (beresp.http.Cache-Control ~ "(public)" && beresp.http.Vary !~ "X-Authcache-Key") {
+      set beresp.http.Vary = beresp.http.Vary + ", X-Authcache-Key";
+      set beresp.http.Vary = regsub(beresp.http.Vary, "^,\s*", "");
+    }
+  }
+  /* END required authcache ESI header */
+
+
+
+  // TODO: Place your custom fetch policy here
+
+  // /* Example 1: Cache 404s, 301s, 500s. */
+  // if (beresp.status == 404 || beresp.status == 301 || beresp.status == 500) {
+  //   set beresp.ttl = 10 m;
+  // }
+
+  // /*
+  //  * Example 2: Do not cache when backend specifies Cache-Control: private,
+  //  * no-cache or no-store.
+  //  */
+  // if (req.esi_level == 0 && beresp.http.Cache-Control ~ "(private|no-cache|no-store)") {
+  //   set beresp.ttl = 0s;
+  // }
 }
- 
-# In the event of an error, show friendlier messages.
-sub vcl_error {
-  # Redirect to some other URL in the case of a homepage failure.
-  #if (req.url ~ "^/?$") {
-  #  set obj.status = 302;
-  #  set obj.http.Location = "http://backup.example.com/";
-  #}
-  set obj.http.Content-Type = "text/html; charset=utf-8";
-  synthetic {"
-<html>
-<head>
-  <title>Page Unavailable</title>
-  <style>
-    body { background: #303030; text-align: center; color: white; }
-    #page { border: 1px solid #CCC; width: 500px; margin: 100px auto 0; padding: 30px; background: #323232; }
-    a, a:link, a:visited { color: #CCC; }
-    .error { color: #222; }
-  </style>
-</head>
-<body onload="setTimeout(function() { window.location = '/' }, 5000)">
-  <div id="page">    <h1 class="title">Page Unavailable</h1>
-    <p>The page you requested is temporarily unavailable.</p>
-    <p>We're redirecting you to the <a href="/">homepage</a> in 5 seconds.</p>
-    <div class="error">(Error "} + obj.status + " " + obj.response + {")</div>
-  </div>
-</body>
-</html>
-"};
-  return (deliver);
+
+sub vcl_deliver {
+  /**
+   * BEGIN required authcache key-retrieval logic
+   *
+   * It should not be necessary to modify this section. Please file a bug or
+   * feature request if you find a situation where this part of the VCL is not
+   * appropriate.
+   *
+   * https://drupal.org/project/issues/authcache
+   **/
+  // Process response from authcache-key callback
+  if (req.http.X-Authcache-Get-Key == "sent") {
+    // Copy over the X-Authcache-Key header if set
+    if (resp.http.X-Authcache-Key) {
+      set req.http.X-Authcache-Key = resp.http.X-Authcache-Key;
+    }
+    // Proceed to next state
+    set req.http.X-Authcache-Get-Key = "received";
+    return (restart);
+  }
+
+  // When sending a response from an authcache enabled backend to the browser:
+  if (resp.http.Vary ~ "X-Authcache-Key") {
+    // 1. Ensure that a Vary: Cookie is on the response
+    if (resp.http.Vary !~ "Cookie") {
+      set resp.http.Vary = resp.http.Vary + ", Cookie";
+    }
+    // 2. Ensure that Vary: X-Authcache-Key is *not* on the response
+    set resp.http.Vary = regsub(resp.http.Vary, "(^|,\s*)X-Authcache-Key", "");
+    // 3. Remove a "," prefix, if present.
+    set resp.http.Vary = regsub(resp.http.Vary, "^,\s*", "");
+  }
+
+  // Remove variables placed on backend response.
+  unset resp.http.X-Authcache-Do-ESI;
+  unset resp.http.X-Authcache-Ban-Tag;
+
+  /* END required authcache key-retrieval logic */
+
+
+
+  // TODO: Modify response, add / remove headers
+  // /**
+  //  * Example 1: Disable browser cache in Safari.
+  //  *
+  //  * @see:
+  //  *   - https://bugs.webkit.org/show_bug.cgi?id=71509
+  //  *   - https://groups.drupal.org/node/191453
+  //  *   - https://drupal.org/node/1910178
+  //  */
+  // if (resp.http.X-Generator ~ "Drupal" && req.http.user-agent ~ "Safari" && req.http.user-agent !~ "Chrome") {
+     set resp.http.Cache-Control = "no-cache, must-revalidate, post-check=0, pre-check=0";
+  // }
+
+  // /**
+  //  * Example 2: Add a hit-miss header to the response.
+  //  *
+  //  * See:
+  //  * https://www.varnish-cache.org/trac/wiki/VCLExampleHitMissHeader
+  //  */
+   if (obj.hits > 0) {
+     set resp.http.X-Varnish-Cache = "HIT";
+   }
+   else {
+     set resp.http.X-Varnish-Cache = "MISS";
+   }
 }
- 
-#
-# Below is a commented-out copy of the default VCL logic.  If you
-# redefine any of these subroutines, the built-in logic will be
-# appended to your code.
-# sub vcl_recv {
-#     if (req.restarts == 0) {
-#   if (req.http.x-forwarded-for) {
-#       set req.http.X-Forwarded-For =
-#       req.http.X-Forwarded-For + ", " + client.ip;
-#   } else {
-#       set req.http.X-Forwarded-For = client.ip;
-#   }
-#     }
-#     if (req.request != "GET" &&
-#       req.request != "HEAD" &&
-#       req.request != "PUT" &&
-#       req.request != "POST" &&
-#       req.request != "TRACE" &&
-#       req.request != "OPTIONS" &&
-#       req.request != "DELETE") {
-#         /* Non-RFC2616 or CONNECT which is weird. */
-#         return (pipe);
-#     }
-#     if (req.request != "GET" && req.request != "HEAD") {
-#         /* We only deal with GET and HEAD by default */
-#         return (pass);
-#     }
-#     if (req.http.Authorization || req.http.Cookie) {
-#         /* Not cacheable by default */
-#         return (pass);
-#     }
-#     return (lookup);
-# }
-#
-# sub vcl_pipe {
-#     # Note that only the first request to the backend will have
-#     # X-Forwarded-For set.  If you use X-Forwarded-For and want to
-#     # have it set for all requests, make sure to have:
-#     # set bereq.http.connection = "close";
-#     # here.  It is not set by default as it might break some broken web
-#     # applications, like IIS with NTLM authentication.
-#     return (pipe);
-# }
-#
-# sub vcl_pass {
-#     return (pass);
-# }
-#
-# sub vcl_hash {
-#     hash_data(req.url);
-#     if (req.http.host) {
-#         hash_data(req.http.host);
-#     } else {
-#         hash_data(server.ip);
-#     }
-#     return (hash);
-# }
-#
-# sub vcl_hit {
-#     return (deliver);
-# }
-#
-# sub vcl_miss {
-#     return (fetch);
-# }
-#
-# sub vcl_fetch {
-#     if (beresp.ttl <= 0s ||
-#         beresp.http.Set-Cookie ||
-#         beresp.http.Vary == "*") {
-#       /*
-#        * Mark as "Hit-For-Pass" for the next 2 minutes
-#        */
-#       set beresp.ttl = 120 s;
-#       return (hit_for_pass);
-#     }
-#     return (deliver);
-# }
-#
-# sub vcl_deliver {
-#     return (deliver);
-# }
-#
-# sub vcl_error {
-#     set obj.http.Content-Type = "text/html; charset=utf-8";
-#     set obj.http.Retry-After = "5";
-#     synthetic {"
-# <?xml version="1.0" encoding="utf-8"?>
-# <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
-#  "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
-# <html>
-#   <head>
-#     <title>"} + obj.status + " " + obj.response + {"</title>
-#   </head>
-#   <body>
-#     <h1>Error "} + obj.status + " " + obj.response + {"</h1>
-#     <p>"} + obj.response + {"</p>
-#     <h3>Guru Meditation:</h3>
-#     <p>XID: "} + req.xid + {"</p>
-#     <hr>
-#     <p>Varnish cache server</p>
-#   </body>
-# </html>
-# "};
-#     return (deliver);
-# }
-#
-# sub vcl_init {
-#   return (ok);
-# }
-#
-# sub vcl_fini {
-#   return (ok);
-# }
